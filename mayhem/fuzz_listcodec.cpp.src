@@ -1,0 +1,87 @@
+// mayhem/fuzz_listcodec.cpp.src — fuzzes the two "list compressor" codecs in
+// 3_list_compressors/code: elias_fano (encode/access via darray::select, needs BMI2/POPCNT)
+// and interpolative (recursive binary interpolative coding). Both codecs' real load()/save()
+// go through std::ifstream/std::ofstream, which this harness deliberately does NOT use (no
+// filesystem access anywhere in this TU, per the net-new harness rule) — instead it drives
+// the SAME in-memory API upstream's own compress/decompress CLIs are built on
+// (CoDec::encode(uint32_t const*, n) / CoDec::decode(uint32_t*)) and asserts an exact
+// known-answer property: decode(encode(x)) == x for every element. That is a real,
+// upstream-defined correctness invariant of both codecs (see 3_list_compressors/code/check.cpp,
+// which checks exactly this after a round trip through disk), not a harness-invented one.
+//
+// Header-only codecs => this TU IS the library for coverage/instrumentation purposes; no
+// separate .a/.o exists to miss $SANITIZER_FLAGS.
+#include <cstdint>
+#include <cstddef>
+#include <cstdlib>
+#include <vector>
+// bit_vector.hpp/darray.hpp use std::cout/std::ofstream without including <iostream>/<fstream>
+// themselves (they always compile upstream only because compress.cpp/check.cpp happen to
+// include those first); pull them in explicitly rather than relying on include order.
+#include <iostream>
+#include <fstream>
+
+#include "3_list_compressors/code/elias_fano.hpp"
+#include "3_list_compressors/code/interpolative.hpp"
+
+// Bound the derived list length so one fuzzer exec can't blow the time/memory budget.
+static constexpr size_t kMaxN = 512;
+
+template <typename CoDec>
+static void roundtrip(std::vector<uint32_t> const& values) {
+    CoDec codec;
+    codec.encode(values.data(), values.size());
+
+    std::vector<uint32_t> out(values.size());
+    codec.decode(out.data());
+
+    // Known-answer property, independent of NDEBUG: a mismatch is a genuine encode/decode
+    // defect in the codec, so fail loudly regardless of whether asserts are compiled in.
+    for (size_t i = 0; i != values.size(); ++i) {
+        if (out[i] != values[i]) abort();
+    }
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 2) return 0;
+    uint8_t sel = data[0] % 2;
+    data += 1;
+    size -= 1;
+
+    // Derive a strictly increasing uint32_t list from the fuzz bytes. Both codecs require
+    // (and assert) a sorted, duplicate-free list whose universe u=values.back() satisfies
+    // u >= n - 1 (interpolative) / u >= n (elias_fano, since m_l = ceil(log2(u/n)) must be
+    // computable) — a per-element delta of at least 1 guarantees both invariants hold for
+    // EVERY input, so the harness explores real encode/decode behavior instead of just
+    // hitting the precondition assert on every run.
+    std::vector<uint32_t> values;
+    values.reserve(size < kMaxN ? size : kMaxN);
+    uint32_t cur = 0;
+    for (size_t i = 0; i != size && values.size() < kMaxN; ++i) {
+        uint32_t delta = (uint32_t)(data[i] % 64) + 1;  // in [1, 64]
+        cur += delta;
+        values.push_back(cur);
+    }
+    if (values.empty()) return 0;
+
+    // KNOWN FINDING (see mayhem/fuzz_listcodec/known-findings/ef-ml-zero-div/): elias_fano's
+    // m_l = ceil(log2(u/n)) is exactly 0 whenever u == n (the densest possible list: every
+    // delta is 1, e.g. 1,2,3,...,n -- not even a malformed/edge case, just an ordinary dense
+    // list), and elias_fano::size()/decode() then divides by m_l unconditionally
+    // (elias_fano.hpp:62, `m_low_bits.num_bits() / m_l`) -> UBSan division-by-zero on every
+    // such round trip. Real, upstream, deterministic, and (since a run of `delta==1` bytes is
+    // an easy, common mutation) it dominated every fork-mode exec once found: coverage
+    // flatlined at 549/1458 with ~4000 identical crashes in 100s. Bumping the final value by
+    // one keeps the list strictly increasing (still a valid encode() input) while forcing
+    // u > n strictly, so log2(u/n) > 0 and m_l >= 1 always -- the fix lives entirely in what
+    // synthetic input this harness manufactures, not in upstream code, and the bug itself is
+    // still fully demonstrated by the standalone reproducer under known-findings/.
+    values.back() += 1;
+
+    if (sel == 0) {
+        roundtrip<elias_fano>(values);
+    } else {
+        roundtrip<interpolative>(values);
+    }
+    return 0;
+}

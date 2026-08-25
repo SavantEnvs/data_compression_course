@@ -1,0 +1,8 @@
+project: savantenvs/data_compression_course
+target: fuzz-listcodec
+testsuite:
+  - https://$MAYHEM_DOMAIN/$MAYHEM_PROJECT/$MAYHEM_TARGET/testsuite.tar
+  - file://mayhem/fuzz-listcodec/testsuite
+cmds:
+  - cmd: /mayhem/fuzz_listcodec
+    libfuzzer: true

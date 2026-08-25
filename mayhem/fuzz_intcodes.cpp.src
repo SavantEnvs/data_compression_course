@@ -1,0 +1,115 @@
+// mayhem/fuzz_intcodes.cpp.src — fuzzes the bit-level integer codecs in
+// 2_integer_codes/code/integer_codes.hpp (gamma / delta / rice_k1 / rice_k2 / vbyte) the same
+// way upstream's own compress.cpp/decompress.cpp use them: encode a sequence of uint32_t
+// values with write_<codec>, then decode them back with read_<codec>, and assert the decoded
+// sequence is identical to the original -- the exact known-answer property
+// 3_list_compressors/code/check.cpp (and this repo's own README round trip) checks after a
+// real compress+decompress run, just driven from memory instead of two on-disk files.
+//
+// No filesystem access anywhere in this TU (the net-new harness rule: bytes only from the
+// fuzzer). Header-only codecs => this TU IS the library for coverage purposes; there is no
+// separate .a/.o for $SANITIZER_FLAGS to miss.
+//
+// Harness history worth recording for whoever touches this next: the FIRST version of this
+// harness fed raw fuzz bytes straight into a bit_vector and decoded them as an arbitrary
+// (self-declared num_lists/list_size) bitstream, i.e. fuzzed decode-of-malformed-data instead
+// of round-trip. That surfaced three real upstream bugs fast (recorded under
+// known-findings/legacy-malformed-decode-harness/) but every one of them is reachable from
+// literally the first few bytes of almost ANY input (gamma/delta/rice have zero bounds
+// checking on their own decoded bit-widths, so a stray high bit anywhere near the front
+// reliably sends `it.take(b)` an out-of-range `b`), so fork-mode runs converged on ONE crash
+// PC with flat coverage (173/241 edges, ~350-450 crashes/45s, corpus stuck at 6-8) -- the
+// "rediscovering one bug forever" pattern the net-new brief says to fix rather than ship. This
+// round-trip form drives the real arithmetic across the full uint32_t range (including
+// adversarial values like 0 and UINT32_MAX) and only crashes on a genuine encode/decode
+// mismatch or internal codec bug, which let coverage keep climbing instead of flatlining.
+#include <cstdint>
+#include <cstddef>
+#include <cstdlib>
+#include <vector>
+// bit_vector.hpp uses std::cout without including <iostream> itself (it always compiles
+// upstream because compress.cpp/decompress.cpp happen to #include <iostream> first); pull it
+// in explicitly here rather than relying on include order.
+#include <iostream>
+
+#include "2_integer_codes/code/integer_codes.hpp"
+
+// Bound work per input so a large fuzzer-grown input can't blow the time budget.
+static constexpr size_t kMaxN = 256;
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 5) return 0;  // 1 selector byte + at least one 4-byte value
+    uint8_t codec_sel = data[0] % 5;
+    data += 1;
+    size -= 1;
+
+    // Derive up to kMaxN uint32_t values from the fuzz bytes, 4 bytes each (a short trailing
+    // remainder is simply dropped, not zero-padded, so the fuzzer's own bytes fully determine
+    // every value -- including the boundary/adversarial ones like 0x00000000 and 0xFFFFFFFF
+    // that a coverage-guided mutator gravitates toward).
+    size_t n = size / 4;
+    if (n > kMaxN) n = kMaxN;
+    if (n == 0) return 0;
+
+    std::vector<uint32_t> values;
+    values.reserve(n);
+    for (size_t i = 0; i != n; ++i) {
+        uint32_t v = (uint32_t)data[i * 4] | ((uint32_t)data[i * 4 + 1] << 8) |
+                     ((uint32_t)data[i * 4 + 2] << 16) | ((uint32_t)data[i * 4 + 3] << 24);
+        // KNOWN FINDING (see mayhem/fuzz_intcodes/known-findings/gamma-uint32-max-msb-trunc/):
+        // write_gamma(builder, x) computes `msb(x + 1)`, but msb()'s parameter is uint32_t
+        // while write_gamma's own `xx = x + 1` is computed in uint64_t -- so at exactly
+        // x == UINT32_MAX, xx == 2^32 silently truncates to 0 when passed into msb(), which
+        // then hits its own `assert(x > 0)` (util.hpp:18). Reproducible standalone (no fuzzer
+        // needed): write_gamma(builder, 0xFFFFFFFFu). Real, upstream, and 100% deterministic
+        // once a coverage-guided mutator finds the value (which SanCov's cmp-tracing makes it
+        // find almost immediately, since 0xFFFFFFFF is exactly the kind of integer-comparison
+        // boundary constant libFuzzer targets) -- so leaving it in this harness's input space
+        // means every subsequent exec that includes it re-hits the identical assert, which
+        // empirically flatlined fork-mode coverage at 270/587 with 1000+ identical crashes in
+        // 100s (the "rediscovering one bug forever" pattern the net-new brief says to fix
+        // rather than ship, analogous to guarding a hang precondition -- the defect is still
+        // fully demonstrated by the standalone reproducer, just not manufactured by every
+        // other exec here). Clamp only that single value so the REST of the uint32_t range
+        // (including every other boundary the fuzzer finds) keeps getting explored.
+        if (v == 0xFFFFFFFFu) v = 0xFFFFFFFEu;
+        values.push_back(v);
+    }
+
+    bit_vector_builder builder;
+    switch (codec_sel) {
+        case 0:
+            for (uint32_t v : values) write_gamma(builder, v);
+            break;
+        case 1:
+            for (uint32_t v : values) write_delta(builder, v);
+            break;
+        case 2:
+            for (uint32_t v : values) write_vbyte(builder, v);
+            break;
+        case 3:
+            for (uint32_t v : values) write_rice(builder, v, 1);
+            break;
+        default:
+            for (uint32_t v : values) write_rice(builder, v, 2);
+            break;
+    }
+    bit_vector bits;
+    builder.build(bits);
+
+    bit_vector_iterator it(bits);
+    for (uint32_t expected : values) {
+        uint32_t got;
+        switch (codec_sel) {
+            case 0: got = (uint32_t)read_gamma(it); break;
+            case 1: got = (uint32_t)read_delta(it); break;
+            case 2: got = (uint32_t)read_vbyte(it); break;
+            case 3: got = (uint32_t)read_rice(it, 1); break;
+            default: got = (uint32_t)read_rice(it, 2); break;
+        }
+        // Known-answer property, independent of NDEBUG: a mismatch is a genuine encode/decode
+        // defect in the codec, so fail loudly regardless of whether asserts are compiled in.
+        if (got != expected) abort();
+    }
+    return 0;
+}
