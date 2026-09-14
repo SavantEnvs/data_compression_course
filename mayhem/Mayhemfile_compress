@@ -1,0 +1,9 @@
+project: savantenvs/data_compression_course
+target: compress-buggy-mhh-run-7
+testsuite:
+  - https://$MAYHEM_DOMAIN/$MAYHEM_PROJECT/$MAYHEM_TARGET/testsuite.tar
+  - file://mayhem/compress-buggy-mhh-run-7/testsuite
+cmds:
+  - cmd: /mayhem/compress gamma @@ /dev/null
+    env:
+      DISABLE_SMOKETEST: '1'
